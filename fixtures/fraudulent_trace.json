@@ -1,0 +1,10 @@
+[
+  {
+    "step": 0,
+    "opcode": "OP_ASSERT_SOLVENCY",
+    "stack_before": ["100", "1000"],
+    "stack_after": ["true"],
+    "witness_hash": "0xabc1230000000000000000000000000000000000000000000000000000000000",
+    "l1_predicate": "01645a9502e8035f95a269"
+  }
+]
