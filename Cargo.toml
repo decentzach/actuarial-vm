@@ -1,0 +1,18 @@
+[package]
+name = "actuarial-vm"
+version = "0.1.0"
+edition = "2021"
+description = "Domain-Specific VM for Bitcoin Settlement via BitVM 2 — Actuarial Primitive Opcodes for insurance-grade contracts."
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["bitcoin", "bitvm", "insurance", "no-std", "vm"]
+categories = ["no-std", "cryptography"]
+
+[features]
+default = ["std"]
+std = []
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]
