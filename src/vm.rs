@@ -21,6 +21,7 @@
 
 use crate::opcodes::{OP_ASSERT_SOLVENCY, OP_COMMIT_INDEMNITY, OP_EVAL_STARK};
 
+use crate::opcodes;
 /// Minimum Solvency Ratio Ψ, scaled by [`PSI_SCALE`] to stay in integer math.
 ///
 /// Ψ_min = 1.5  →  encoded as `15` with `PSI_SCALE = 10`.
@@ -142,9 +143,10 @@ impl Vm {
         opcode: u8,
         claim: &ClaimPrimitive,
         ctx: &ExecCtx<'_>,
+        script: &mut Vec<u8>,
     ) -> Result<(), VmError> {
         match opcode {
-            OP_ASSERT_SOLVENCY => self.op_assert_solvency(claim),
+            OP_ASSERT_SOLVENCY => self.op_assert_solvency(claim, script),
             OP_EVAL_STARK => self.op_eval_stark(claim, ctx),
             OP_COMMIT_INDEMNITY => self.op_commit_indemnity(claim),
             other => Err(VmError::UnknownOpcode(other)),
@@ -155,24 +157,24 @@ impl Vm {
     ///
     /// Computes Ψ = 𝓑 / α_max in fixed-point (`PSI_SCALE`) and enforces
     /// Ψ ≥ 1.5. Uses `checked_mul` to honor I-3 (deterministic, no wrap).
-    pub(crate) fn op_assert_solvency(&self, claim: &ClaimPrimitive) -> Result<(), VmError> {
-        if claim.alpha_max_sats == 0 {
-            return Ok(());
-        }
-
-        let balance_scaled = (self.pool_balance_sats as u128)
-            .checked_mul(PSI_SCALE)
-            .ok_or(VmError::ArithmeticOverflow)?;
-
-        let threshold = (claim.alpha_max_sats as u128)
-            .checked_mul(PSI_MIN_SCALED)
-            .ok_or(VmError::ArithmeticOverflow)?;
-
-        if balance_scaled >= threshold {
-            Ok(())
-        } else {
-            Err(VmError::SolvencyException)
-        }
+    pub(crate) fn op_assert_solvency(
+        &self,
+        claim: &ClaimPrimitive,
+        script: &mut Vec<u8>,
+    ) -> Result<(), VmError> {
+        script.extend([
+    opcodes::OP_PUSHBYTES_8,
+    (self.pool_balance_sats as u128).to_le_bytes()[0],
+    opcodes::OP_PUSHBYTES_8,
+    (claim.alpha_max_sats as u128).to_le_bytes()[0],
+    opcodes::OP_FIXEDPOINT_MUL,
+    opcodes::OP_PUSHBYTES_2,
+    (PSI_MIN_SCALED as u16).to_le_bytes()[0],
+    (PSI_MIN_SCALED as u16).to_le_bytes()[1],
+    opcodes::OP_GREATERTHANOREQUAL,
+    opcodes::OP_VERIFY,
+]);
+Ok(())
     }
 
     /// `OP_EVAL_STARK` (0x02).
@@ -214,16 +216,28 @@ mod tests {
     #[test]
     fn solvency_passes_when_psi_at_threshold() {
         let vm = Vm::new(1_500);
+        let mut script = Vec::new();
         assert!(vm
-            .execute(OP_ASSERT_SOLVENCY, &mock_claim(1_000), &ExecCtx::default())
+            .execute(
+                OP_ASSERT_SOLVENCY,
+                &mock_claim(1_000),
+                &ExecCtx::default(),
+                &mut script
+            )
             .is_ok());
     }
 
     #[test]
     fn solvency_fails_below_threshold() {
         let vm = Vm::new(1_499);
+        let mut script = Vec::new();
         assert_eq!(
-            vm.execute(OP_ASSERT_SOLVENCY, &mock_claim(1_000), &ExecCtx::default()),
+            vm.execute(
+                OP_ASSERT_SOLVENCY,
+                &mock_claim(1_000),
+                &ExecCtx::default(),
+                &mut script
+            ),
             Err(VmError::SolvencyException)
         );
     }
@@ -231,8 +245,9 @@ mod tests {
     #[test]
     fn unknown_opcode_is_rejected() {
         let vm = Vm::new(10_000);
+        let mut script = Vec::new();
         assert_eq!(
-            vm.execute(0xFF, &mock_claim(1), &ExecCtx::default()),
+            vm.execute(0xFF, &mock_claim(1), &ExecCtx::default(), &mut script),
             Err(VmError::UnknownOpcode(0xFF))
         );
     }
@@ -240,8 +255,14 @@ mod tests {
     #[test]
     fn eval_stark_without_verifier_fails_closed() {
         let vm = Vm::new(10_000);
+        let mut script = Vec::new();
         assert_eq!(
-            vm.execute(OP_EVAL_STARK, &mock_claim(1), &ExecCtx::default()),
+            vm.execute(
+                OP_EVAL_STARK,
+                &mock_claim(1),
+                &ExecCtx::default(),
+                &mut script
+            ),
             Err(VmError::MissingVerifier)
         );
     }
@@ -252,12 +273,13 @@ mod tests {
         let verifier = MockWeatherVerifier::new(sig);
         let bad_proof = [0x00u8; 32];
         let vm = Vm::new(10_000);
+        let mut script = Vec::new();
         let ctx = ExecCtx {
             proof: &bad_proof,
             verifier: Some(&verifier),
         };
         assert_eq!(
-            vm.execute(OP_EVAL_STARK, &mock_claim(1_000), &ctx),
+            vm.execute(OP_EVAL_STARK, &mock_claim(1_000), &ctx, &mut script),
             Err(VmError::AttestationRejected)
         );
     }
@@ -272,20 +294,31 @@ mod tests {
 
         let claim = mock_claim(1_000_000);
         let vm = Vm::new(2_000_000);
+        let mut script = Vec::new();
 
         let ctx = ExecCtx {
             proof: &proof,
             verifier: Some(&verifier),
         };
 
-        vm.execute(OP_ASSERT_SOLVENCY, &claim, &ExecCtx::default())
-            .expect("Ψ = 2.0 should satisfy Ψ ≥ 1.5");
+        vm.execute(
+            OP_ASSERT_SOLVENCY,
+            &claim,
+            &ExecCtx::default(),
+            &mut script,
+        )
+        .expect("Ψ = 2.0 should satisfy Ψ ≥ 1.5");
 
-        vm.execute(OP_EVAL_STARK, &claim, &ctx)
+        vm.execute(OP_EVAL_STARK, &claim, &ctx, &mut script)
             .expect("valid sensor-signed proof must verify");
 
-        vm.execute(OP_COMMIT_INDEMNITY, &claim, &ExecCtx::default())
-            .expect("commitment must succeed once solvency + attestation pass");
+        vm.execute(
+            OP_COMMIT_INDEMNITY,
+            &claim,
+            &ExecCtx::default(),
+            &mut script,
+        )
+        .expect("commitment must succeed once solvency + attestation pass");
     }
 
     #[test]
@@ -293,8 +326,14 @@ mod tests {
         let mut vm = Vm::new(2_000_000);
         vm.is_under_challenge = true;
         let claim = mock_claim(1_000_000);
+        let mut script = Vec::new();
         assert_eq!(
-            vm.execute(OP_COMMIT_INDEMNITY, &claim, &ExecCtx::default()),
+            vm.execute(
+                OP_COMMIT_INDEMNITY,
+                &claim,
+                &ExecCtx::default(),
+                &mut script
+            ),
             Err(VmError::ProtocolUnderChallenge)
         );
     }
