@@ -196,6 +196,50 @@ impl Vm {
         }
         Ok(())
     }
+
+    // ============================
+    // V3 ADDITION
+    // ============================
+
+    pub fn validate_witness_trace(
+        &self,
+        claim_alpha_max: u64,
+        pool_balance: u64,
+        trace_b: u64,
+        trace_alpha: u64,
+    ) -> bool {
+        (trace_b as u128)
+            * (claim_alpha_max as u128)
+            == (trace_alpha as u128)
+            * (pool_balance as u128)
+            && trace_b > 0
+            && trace_alpha > 0
+    }
+
+    pub fn execute_assert_solvency_v3(
+        &self,
+        claim: &ClaimPrimitive,
+        trace_b: u64,
+        trace_alpha: u64,
+    ) -> Result<(), VmError> {
+        if !self.validate_witness_trace(
+            claim.alpha_max_sats,
+            self.pool_balance_sats,
+            trace_b,
+            trace_alpha,
+        ) {
+            return Err(VmError::AttestationRejected);
+        }
+
+        let lhs = (self.pool_balance_sats as u128) * 2;
+        let rhs = (claim.alpha_max_sats as u128) * 3;
+
+        if lhs >= rhs {
+            Ok(())
+        } else {
+            Err(VmError::SolvencyException)
+        }
+    }
 }
 
 #[cfg(test)]
