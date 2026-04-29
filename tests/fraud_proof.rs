@@ -1,4 +1,7 @@
-use actuarial_vm::taproot_builder::{encode_script_hex, generate_solvency_challenge_script};
+use actuarial_vm::taproot_builder::{
+    encode_script_hex, generate_solvency_challenge_script, generate_solvency_challenge_script_v2,
+    ScalingWitness, SOLVENCY_PREDICATE_V2_HEX,
+};
 use actuarial_vm::{BisectionTrace, ClaimPrimitive, ExecCtx, Vm, VmError, OP_ASSERT_SOLVENCY};
 
 fn mock_claim(alpha_max_sats: u64) -> ClaimPrimitive {
@@ -40,4 +43,21 @@ fn trace_records_fail_closed_stack_after_for_the_fraud_case() {
     let json = trace.to_json();
     assert!(json.contains("\"stack_after\": [\"false\"]"));
     assert!(json.contains("\"l1_predicate\": \"01645a9502e8035f95a269\""));
+}
+
+#[test]
+fn vbyte_crusher_v2_is_smaller_than_v1_for_fraud_case() {
+    // Issue: [BOUNTY] vByte Crusher.
+    // v2 must produce a strictly shorter on-chain script for B=100, α=1000.
+    let v1 = generate_solvency_challenge_script(100, 1_000).unwrap();
+    let v2 = generate_solvency_challenge_script_v2(100, 1_000).unwrap();
+    assert!(v2.len() < v1.len(), "v2 must beat v1 vByte footprint");
+    assert_eq!(encode_script_hex(&v2), SOLVENCY_PREDICATE_V2_HEX);
+}
+
+#[test]
+fn vbyte_crusher_v2_witness_for_target_example() {
+    // Issue example: B = 100,000  α = 150,000  →  reduced witness (2, 3, k=50_000).
+    let w = ScalingWitness::from_raw(100_000, 150_000);
+    assert_eq!((w.balance_scaled, w.alpha_max_scaled, w.gcd), (2, 3, 50_000));
 }
