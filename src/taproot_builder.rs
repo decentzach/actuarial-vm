@@ -195,6 +195,78 @@ const fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
     a
 }
 
+// ---------------------------------------------------------------------------
+// v3 — GCD-reduced inline solvency predicate ("vByte Crusher" + binding).
+// ---------------------------------------------------------------------------
+
+/// Build the v3 (GCD-reduced inline) solvency challenge script.
+///
+/// **Design.** v2 reduced the solvency predicate to a constant 7-byte body
+/// but lost the leaf-hash binding: because `(B', α')` came from the witness,
+/// a malicious prover could supply any pair satisfying `2B' ≥ 3α'` even when
+/// the real `(B, α_max)` is insolvent.
+///
+/// v3 restores the binding by **inlining the reduced operands** `(B', α')`
+/// directly into the script — the same strategy as v1, but on the GCD-
+/// reduced values. The leaf hash now commits to `(B', α')`, making the
+/// predicate immune to witness manipulation.
+///
+/// **Predicate.** The script encodes:
+///
+/// ```text
+/// PUSH(α')  OP_3  OP_MUL  PUSH(B')  OP_2  OP_MUL
+/// OP_LESSTHANOREQUAL  OP_VERIFY
+/// ```
+///
+/// which computes `3α' ≤ 2B'` ⟺ `2B' ≥ 3α'` ⟺ `Ψ ≥ 1.5`.
+///
+/// **Footprint.** Fixed overhead is 6 bytes (OP_3, OP_MUL, OP_2, OP_MUL,
+/// OP_LESSTHANOREQUAL, OP_VERIFY) plus the variable-length pushes for
+/// `α'` and `B'`. Because `B' = B/k ≤ B` and `α' = α_max/k ≤ α_max`,
+/// the push encodings are always **no larger** than v1's — and strictly
+/// smaller whenever `k = gcd(B, α_max) > 1`.
+///
+/// | (B, α_max)            | k       | (B', α')  | v1 bytes | v3 bytes | Saved |
+/// |-----------------------|---------|-----------|----------|----------|-------|
+/// | (100, 1000)           | 100     | (1, 10)   | 12       | 8        | 4     |
+/// | (1500, 1000)          | 500     | (3, 2)    | 12       | 8        | 4     |
+/// | (100000, 150000)      | 50000   | (2, 3)    | 14       | 8        | 6     |
+/// | (2000000, 1000000)    | 1000000 | (2, 1)    | 15       | 8        | 7     |
+/// | (7, 11)               | 1       | (7, 11)   | 8        | 8        | 0     |
+///
+/// **Security.** The leaf hash binds `(B', α')` into the Taproot commitment.
+/// Because `gcd(B', α') = 1` (coprime by construction), the pair uniquely
+/// determines the ratio `B/α_max`. A malicious prover cannot supply
+/// alternative values — they are fixed at address creation time, just like
+/// v1. Off-chain, any Watcher can recover the original `(B, α_max)` from
+/// the published `k` in the execution trace and verify `B'·k = B` against
+/// the funding UTXO amount.
+///
+/// **When k = 1** (coprime inputs), v3 is identical in size to v1 — the
+/// reduced and original operands are the same. v3 never regresses relative
+/// to v1.
+pub fn generate_solvency_challenge_script_v3(
+    pool_balance: u64,
+    alpha_max: u64,
+) -> Result<Vec<u8>, ScriptError> {
+    let witness = ScalingWitness::from_raw(pool_balance, alpha_max);
+
+    let mut script = Vec::with_capacity(24);
+
+    push_u64(&mut script, witness.alpha_max_scaled)?;
+    script.push(OP_3);
+    script.push(OP_MUL);
+
+    push_u64(&mut script, witness.balance_scaled)?;
+    script.push(OP_2);
+    script.push(OP_MUL);
+
+    script.push(OP_LESSTHANOREQUAL);
+    script.push(OP_VERIFY);
+
+    Ok(script)
+}
+
 /// Hex-encode a script for printout / Taproot leaf inclusion.
 pub fn encode_script_hex(script: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -395,5 +467,221 @@ mod tests {
         assert_eq!(w.gcd, 50_000);
         // Ψ = 100_000 / 150_000 = 0.666… < 1.5  → predicate must fail.
         assert!(!eval_v2(w.balance_scaled as i128, w.alpha_max_scaled as i128));
+    }
+
+    // -----------------------------------------------------------------
+    // v3 — GCD-reduced inline solvency predicate.
+    // -----------------------------------------------------------------
+
+    fn eval_v3_script(script: &[u8]) -> bool {
+        let mut stack: Vec<i128> = Vec::new();
+        let mut i = 0;
+        while i < script.len() {
+            let op = script[i];
+            i += 1;
+            match op {
+                0x00 => stack.push(0),
+                0x51..=0x60 => stack.push((op - 0x50) as i128),
+                0x01..=0x4b => {
+                    let len = op as usize;
+                    let mut val: u64 = 0;
+                    for j in 0..len {
+                        val |= (script[i + j] as u64) << (j * 8);
+                    }
+                    stack.push(val as i128);
+                    i += len;
+                }
+                0x4c => {
+                    let len = script[i] as usize;
+                    i += 1;
+                    let mut val: u64 = 0;
+                    for j in 0..len {
+                        val |= (script[i + j] as u64) << (j * 8);
+                    }
+                    stack.push(val as i128);
+                    i += len;
+                }
+                OP_MUL => {
+                    let b = stack.pop().unwrap();
+                    let a = stack.pop().unwrap();
+                    stack.push(a * b);
+                }
+                OP_LESSTHANOREQUAL => {
+                    let b = stack.pop().unwrap();
+                    let a = stack.pop().unwrap();
+                    stack.push(if a <= b { 1 } else { 0 });
+                }
+                OP_VERIFY => {
+                    return *stack.last().unwrap() != 0;
+                }
+                _ => panic!("unsupported opcode in v3 evaluator: {:#x}", op),
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn v3_is_never_larger_than_v1() {
+        let cases = vec![
+            (100, 1_000),
+            (1_500, 1_000),
+            (100_000, 150_000),
+            (2_000_000, 1_000_000),
+            (7, 11),
+            (1, 1),
+            (u64::MAX, u64::MAX),
+            (999_999_999, 1),
+            (1, 999_999_999),
+        ];
+        for (b, a) in cases {
+            let v1 = generate_solvency_challenge_script(b, a).unwrap();
+            let v3 = generate_solvency_challenge_script_v3(b, a).unwrap();
+            assert!(
+                v3.len() <= v1.len(),
+                "v3 ({}) must be ≤ v1 ({}) for (B={}, α={})",
+                v3.len(),
+                v1.len(),
+                b,
+                a
+            );
+        }
+    }
+
+    #[test]
+    fn v3_is_strictly_smaller_than_v1_when_k_gt_1() {
+        let cases = vec![
+            (100, 1_000),
+            (1_500, 1_000),
+            (100_000, 150_000),
+            (2_000_000, 1_000_000),
+        ];
+        for (b, a) in cases {
+            let k = gcd_u64(b, a);
+            assert!(k > 1, "precondition: gcd must be > 1 for ({}, {})", b, a);
+            let v1 = generate_solvency_challenge_script(b, a).unwrap();
+            let v3 = generate_solvency_challenge_script_v3(b, a).unwrap();
+            assert!(
+                v3.len() < v1.len(),
+                "v3 ({}) must be < v1 ({}) when k={} > 1 for (B={}, α={})",
+                v3.len(),
+                v1.len(),
+                k,
+                b,
+                a
+            );
+        }
+    }
+
+    #[test]
+    fn v3_equals_v1_size_when_coprime() {
+        let cases = vec![(7, 11), (13, 17), (1, 1)];
+        for (b, a) in cases {
+            let k = gcd_u64(b, a);
+            assert_eq!(k, 1, "precondition: gcd must be 1 for ({}, {})", b, a);
+            let v1 = generate_solvency_challenge_script(b, a).unwrap();
+            let v3 = generate_solvency_challenge_script_v3(b, a).unwrap();
+            assert_eq!(v3.len(), v1.len(), "v3 must equal v1 when k=1");
+        }
+    }
+
+    #[test]
+    fn v3_passes_when_psi_at_threshold() {
+        let script = generate_solvency_challenge_script_v3(1_500, 1_000).unwrap();
+        assert!(eval_v3_script(&script));
+    }
+
+    #[test]
+    fn v3_rejects_under_capitalized_pool() {
+        let script = generate_solvency_challenge_script_v3(100, 1_000).unwrap();
+        assert!(!eval_v3_script(&script));
+    }
+
+    #[test]
+    fn v3_rejects_just_below_threshold() {
+        let script = generate_solvency_challenge_script_v3(1_499, 1_000).unwrap();
+        assert!(!eval_v3_script(&script));
+    }
+
+    #[test]
+    fn v3_accepts_just_above_threshold() {
+        let script = generate_solvency_challenge_script_v3(1_501, 1_000).unwrap();
+        assert!(eval_v3_script(&script));
+    }
+
+    #[test]
+    fn v3_solvency_verdict_matches_v1() {
+        let cases = vec![
+            (100, 1_000),
+            (1_500, 1_000),
+            (1_499, 1_000),
+            (1_501, 1_000),
+            (100_000, 150_000),
+            (2_000_000, 1_000_000),
+            (7, 11),
+            (1, 1),
+        ];
+        for (b, a) in cases {
+            let v1_passes = {
+                let b10 = (b as u128) * 10;
+                let a15 = (a as u128) * 15;
+                b10 >= a15
+            };
+            let v3_script = generate_solvency_challenge_script_v3(b, a).unwrap();
+            let v3_passes = eval_v3_script(&v3_script);
+            assert_eq!(
+                v1_passes, v3_passes,
+                "v3 verdict must match v1 for (B={}, α={})",
+                b, a
+            );
+        }
+    }
+
+    #[test]
+    fn v3_script_for_fraud_case() {
+        let v3 = generate_solvency_challenge_script_v3(100, 1_000).unwrap();
+        let w = ScalingWitness::from_raw(100, 1_000);
+        assert_eq!((w.balance_scaled, w.alpha_max_scaled), (1, 10));
+        assert_eq!(v3.len(), 8);
+        let hex = encode_script_hex(&v3);
+        assert_eq!(hex, "5a5395515295a169");
+    }
+
+    #[test]
+    fn v3_script_for_solvency_case() {
+        let v3 = generate_solvency_challenge_script_v3(1_500, 1_000).unwrap();
+        let w = ScalingWitness::from_raw(1_500, 1_000);
+        assert_eq!((w.balance_scaled, w.alpha_max_scaled), (3, 2));
+        assert_eq!(v3.len(), 8);
+        let hex = encode_script_hex(&v3);
+        assert_eq!(hex, "525395535295a169");
+    }
+
+    #[test]
+    fn v3_leaf_hash_differs_for_different_inputs() {
+        let s1 = generate_solvency_challenge_script_v3(1_500, 1_000).unwrap();
+        let s2 = generate_solvency_challenge_script_v3(100, 1_000).unwrap();
+        assert_ne!(s1, s2, "different (B, α) must produce different scripts");
+    }
+
+    #[test]
+    fn v3_savings_table() {
+        let cases = vec![
+            (100, 1_000),
+            (1_500, 1_000),
+            (100_000, 150_000),
+            (2_000_000, 1_000_000),
+            (7, 11),
+        ];
+        for (b, a) in cases {
+            let v1 = generate_solvency_challenge_script(b, a).unwrap();
+            let v3 = generate_solvency_challenge_script_v3(b, a).unwrap();
+            let w = ScalingWitness::from_raw(b, a);
+            let saved = v1.len() - v3.len();
+            eprintln!(
+                "  (B={}, α={}) k={} (B'={}, α'={}) v1={}B v3={}B saved={}B",
+                b, a, w.gcd, w.balance_scaled, w.alpha_max_scaled,
+                v1.len(), v3.len(), saved,
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
 use actuarial_vm::taproot_builder::{
     encode_script_hex, generate_solvency_challenge_script, generate_solvency_challenge_script_v2,
-    ScalingWitness, SOLVENCY_PREDICATE_V2_HEX,
+    generate_solvency_challenge_script_v3, ScalingWitness, SOLVENCY_PREDICATE_V2_HEX,
 };
 use actuarial_vm::{BisectionTrace, ClaimPrimitive, ExecCtx, Vm, VmError, OP_ASSERT_SOLVENCY};
 
@@ -60,4 +60,45 @@ fn vbyte_crusher_v2_witness_for_target_example() {
     // Issue example: B = 100,000  α = 150,000  →  reduced witness (2, 3, k=50_000).
     let w = ScalingWitness::from_raw(100_000, 150_000);
     assert_eq!((w.balance_scaled, w.alpha_max_scaled, w.gcd), (2, 3, 50_000));
+}
+
+#[test]
+fn v3_is_smaller_than_v1_for_fraud_case() {
+    let v1 = generate_solvency_challenge_script(100, 1_000).unwrap();
+    let v3 = generate_solvency_challenge_script_v3(100, 1_000).unwrap();
+    assert!(v3.len() < v1.len(), "v3 must beat v1 vByte footprint");
+    assert_ne!(
+        encode_script_hex(&v3),
+        SOLVENCY_PREDICATE_V2_HEX,
+        "v3 must differ from v2 (v3 inlines operands)"
+    );
+}
+
+#[test]
+fn v3_leaf_hash_binds_operands() {
+    let s1 = generate_solvency_challenge_script_v3(1_500, 1_000).unwrap();
+    let s2 = generate_solvency_challenge_script_v3(100, 1_000).unwrap();
+    assert_ne!(s1, s2, "different inputs must produce different leaf scripts");
+}
+
+#[test]
+fn v3_never_exceeds_v1_for_wide_range() {
+    let cases = vec![
+        (100, 1_000),
+        (1_500, 1_000),
+        (100_000, 150_000),
+        (2_000_000, 1_000_000),
+        (7, 11),
+        (1, 1),
+    ];
+    for (b, a) in cases {
+        let v1 = generate_solvency_challenge_script(b, a).unwrap();
+        let v3 = generate_solvency_challenge_script_v3(b, a).unwrap();
+        assert!(
+            v3.len() <= v1.len(),
+            "v3 must be ≤ v1 for (B={}, α={})",
+            b,
+            a
+        );
+    }
 }
