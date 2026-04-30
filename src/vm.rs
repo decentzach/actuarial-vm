@@ -197,10 +197,24 @@ impl Vm {
         Ok(())
     }
 
-    // ============================
-    // V3 ADDITION
-    // ============================
+    // -----------------------------------------------------------------
+    // v3 — witness-bound solvency check (Issue #4 / PR #9).
+    // -----------------------------------------------------------------
 
+    /// Verify that a witness pair `(trace_b, trace_alpha)` is *proportional*
+    /// to the actual `(𝓑, α_max)` known to the VM.
+    ///
+    /// Enforces the cross-product equality
+    ///
+    /// $$\text{trace\_b} \cdot \alpha_{\max} \;=\; \text{trace\_alpha} \cdot \mathcal{B}$$
+    ///
+    /// which holds iff $\text{trace\_b}/\text{trace\_alpha} = \mathcal{B}/\alpha_{\max}$.
+    /// All math is `u128` so the products cannot overflow for any `u64`
+    /// inputs. Constant-time (no iteration), satisfies **I-2**.
+    ///
+    /// Used by [`Vm::execute_assert_solvency_v3`] to bind the witness-scaled
+    /// operands of [`crate::taproot_builder::SOLVENCY_PREDICATE_V2`] to the
+    /// underlying funding UTXO without requiring an additional Taproot leaf.
     pub fn validate_witness_trace(
         &self,
         claim_alpha_max: u64,
@@ -208,14 +222,26 @@ impl Vm {
         trace_b: u64,
         trace_alpha: u64,
     ) -> bool {
-        (trace_b as u128)
-            * (claim_alpha_max as u128)
-            == (trace_alpha as u128)
-            * (pool_balance as u128)
-            && trace_b > 0
-            && trace_alpha > 0
+        if trace_b == 0 || trace_alpha == 0 {
+            return false;
+        }
+        (trace_b as u128) * (claim_alpha_max as u128)
+            == (trace_alpha as u128) * (pool_balance as u128)
     }
 
+    /// `OP_ASSERT_SOLVENCY` with a witness-bound proportional trace.
+    ///
+    /// Two-stage check (both stages fail-closed per **I-6**):
+    ///
+    /// 1. **Binding.** [`Self::validate_witness_trace`] confirms the witness
+    ///    pair is a faithful proportional representation of the on-chain
+    ///    `(𝓑, α_max)`. Tampering yields [`VmError::AttestationRejected`].
+    /// 2. **Solvency.** Verifies $2\mathcal{B} \ge 3\alpha_{\max}$
+    ///    ($\equiv \Psi \ge 1.5$). Failure yields
+    ///    [`VmError::SolvencyException`].
+    ///
+    /// All arithmetic is `u128` saturating-multiply on `u64` inputs, so the
+    /// products are bounded by `2^128` and cannot wrap. `O(1)`.
     pub fn execute_assert_solvency_v3(
         &self,
         claim: &ClaimPrimitive,
@@ -231,8 +257,12 @@ impl Vm {
             return Err(VmError::AttestationRejected);
         }
 
-        let lhs = (self.pool_balance_sats as u128) * 2;
-        let rhs = (claim.alpha_max_sats as u128) * 3;
+        let lhs = (self.pool_balance_sats as u128)
+            .checked_mul(2)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let rhs = (claim.alpha_max_sats as u128)
+            .checked_mul(3)
+            .ok_or(VmError::ArithmeticOverflow)?;
 
         if lhs >= rhs {
             Ok(())
